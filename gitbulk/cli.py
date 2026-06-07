@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import typer
 from rich.console import Console
 
 from . import __version__
 from .config import find_manifest, generate_manifest, load_manifest
-from .executor import run_parallel
+from .executor import retry_failed, run_parallel
 from .git_ops import (
     checkout_branch,
     create_tag,
@@ -19,7 +19,7 @@ from .git_ops import (
     pull_repo,
     sync_fork,
 )
-from .models import OperationResult
+from .models import OperationResult, RepoStatus
 from .report import (
     console,
     print_fail_details,
@@ -78,6 +78,130 @@ def _maybe_save_json(report, json_output: Optional[str]):
         console.print(f"[dim]JSON report saved to {json_output}[/dim]")
 
 
+def _repo_name(path: str) -> str:
+    return Path(path).name
+
+
+def _make_verbose_callbacks(
+    verbose: bool,
+) -> tuple[Optional[Callable], Optional[Callable], Optional[Callable], Optional[Callable]]:
+    if not verbose:
+        return None, None, None, None
+
+    def _on_start(event: str, repo_path: str, result: Optional[OperationResult]):
+        name = _repo_name(repo_path)
+        console.print(f"  [cyan]▶[/cyan] {name} [dim]starting...[/dim]")
+
+    def _on_done(event: str, repo_path: str, result: Optional[OperationResult]):
+        if result is None:
+            return
+        name = _repo_name(repo_path)
+        duration = result.meta.get("durationMs", 0) if result.meta else 0
+        if result.skipped:
+            console.print(f"  [yellow]⊘[/yellow] {name} [yellow]skipped[/yellow] [dim]({result.skip_reason})[/dim]")
+        elif result.ok:
+            console.print(f"  [green]✓[/green] {name} [green]ok[/green] [dim](exit {result.exit_code}, {duration}ms)[/dim]")
+            if result.stdout:
+                tail_lines = [l for l in result.stdout.splitlines() if l.strip()][-5:]
+                for line in tail_lines:
+                    console.print(f"    [dim]out:[/dim] {line}")
+        else:
+            console.print(f"  [red]✗[/red] {name} [red]fail[/red] [dim](exit {result.exit_code}, {duration}ms)[/dim]")
+            if result.stderr:
+                for line in result.stderr.splitlines():
+                    console.print(f"    [dim]err:[/dim] {line}")
+            elif result.stdout:
+                for line in result.stdout.splitlines():
+                    console.print(f"    [dim]out:[/dim] {line}")
+
+    def _on_retry_start(event: str, info: str, result: Optional[OperationResult]):
+        if event == "retry_start":
+            console.print()
+            console.print(f"[yellow]🔄 Retry {info}[/yellow]")
+        elif event == "start":
+            name = _repo_name(info)
+            console.print(f"    [cyan]▶[/cyan] {name} [dim]retrying...[/dim]")
+
+    def _on_retry_done(event: str, repo_path: str, result: Optional[OperationResult]):
+        if result is None:
+            return
+        name = _repo_name(repo_path)
+        duration = result.meta.get("durationMs", 0) if result.meta else 0
+        if result.ok:
+            console.print(f"    [green]✓[/green] {name} [green]ok[/green] [dim](exit {result.exit_code}, {duration}ms)[/dim]")
+        else:
+            console.print(f"    [red]✗[/red] {name} [red]still failing[/red] [dim](exit {result.exit_code}, {duration}ms)[/dim]")
+
+    return _on_start, _on_done, _on_retry_start, _on_retry_done
+
+
+def _run_operation(
+    repos: list,
+    task_fn: Callable,
+    task_args: Optional[dict] = None,
+    command_name: str = "operation",
+    parallel: int = 4,
+    retry: int = 0,
+    fail_fast: bool = False,
+    verbose: bool = False,
+) -> "Report":
+    from .models import Report
+
+    on_start, on_done, on_retry_start, on_retry_done = _make_verbose_callbacks(verbose)
+
+    if verbose:
+        console.print(f"[bold]Running '{command_name}' on {len(repos)} repos...[/bold]")
+
+    report = run_parallel(
+        repos=repos,
+        task_fn=task_fn,
+        task_args=task_args,
+        max_workers=parallel,
+        command_name=command_name,
+        fail_fast=fail_fast,
+        on_start=on_start,
+        on_done=on_done,
+    )
+
+    if retry > 0 and report.fail_count > 0:
+        if verbose:
+            console.print()
+            console.print(
+                f"[dim]{report.fail_count} repo(s) failed, retrying up to {retry} time(s)...[/dim]"
+            )
+        report = retry_failed(
+            report=report,
+            repos=repos,
+            task_fn=task_fn,
+            task_args=task_args,
+            max_workers=parallel,
+            max_retries=retry,
+            on_retry_start=on_retry_start,
+            on_retry_done=on_retry_done,
+        )
+
+    return report
+
+
+def _finish_report(
+    report,
+    json_output: Optional[str],
+    dry_run: bool = False,
+    show_fail_details: bool = True,
+) -> None:
+    if dry_run:
+        console.print("[dim](dry-run mode, no actual changes made)[/dim]")
+
+    print_results_table(report)
+    print_summary(report)
+    if show_fail_details and not dry_run:
+        print_fail_details(report)
+    _maybe_save_json(report, json_output)
+
+    if report.fail_count > 0:
+        raise typer.Exit(code=1)
+
+
 @app.command("list")
 def list_cmd(
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
@@ -94,6 +218,7 @@ def status(
     fetch: bool = typer.Option(False, "--fetch", help="Fetch from remote before status"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
     parallel: int = typer.Option(4, "--parallel", "-j", help="Number of parallel workers"),
+    retry: int = typer.Option(0, "--retry", "-r", min=0, max=10, help="Number of retries on failure"),
     json_output: Optional[str] = typer.Option(None, "--json", help="Save JSON report to file"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
@@ -118,14 +243,15 @@ def status(
             },
         )
 
-    report = run_parallel(
+    report = _run_operation(
         repos=repos,
         task_fn=_task,
-        max_workers=parallel,
         command_name="status",
+        parallel=parallel,
+        retry=retry,
+        verbose=verbose,
     )
 
-    from .models import RepoStatus
     statuses = []
     for r in report.results:
         meta = r.meta
@@ -151,6 +277,7 @@ def pull(
     no_ff_only: bool = typer.Option(False, "--no-ff-only", help="Disable fast-forward only"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
     parallel: int = typer.Option(4, "--parallel", "-j", help="Number of parallel workers"),
+    retry: int = typer.Option(0, "--retry", "-r", min=0, max=10, help="Number of retries on failure"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done"),
     json_output: Optional[str] = typer.Option(None, "--json", help="Save JSON report to file"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
@@ -168,21 +295,16 @@ def pull(
             dry_run=dry_run,
         )
 
-    report = run_parallel(
+    report = _run_operation(
         repos=repos,
         task_fn=_task,
-        max_workers=parallel,
         command_name="pull",
+        parallel=parallel,
+        retry=retry,
+        verbose=verbose,
     )
 
-    print_results_table(report)
-    print_summary(report)
-    if not dry_run:
-        print_fail_details(report)
-    _maybe_save_json(report, json_output)
-
-    if report.fail_count > 0:
-        raise typer.Exit(code=1)
+    _finish_report(report, json_output, dry_run=dry_run)
 
 
 @app.command()
@@ -191,8 +313,10 @@ def checkout(
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
     parallel: int = typer.Option(4, "--parallel", "-j", help="Number of parallel workers"),
+    retry: int = typer.Option(0, "--retry", "-r", min=0, max=10, help="Number of retries on failure"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done"),
     json_output: Optional[str] = typer.Option(None, "--json", help="Save JSON report to file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Checkout a branch in all repositories."""
     _, repos = _get_repos(manifest, group)
@@ -200,21 +324,16 @@ def checkout(
     def _task(repo):
         return checkout_branch(repo.path, branch=branch, dry_run=dry_run)
 
-    report = run_parallel(
+    report = _run_operation(
         repos=repos,
         task_fn=_task,
-        max_workers=parallel,
         command_name=f"checkout {branch}",
+        parallel=parallel,
+        retry=retry,
+        verbose=verbose,
     )
 
-    print_results_table(report)
-    print_summary(report)
-    if not dry_run:
-        print_fail_details(report)
-    _maybe_save_json(report, json_output)
-
-    if report.fail_count > 0:
-        raise typer.Exit(code=1)
+    _finish_report(report, json_output, dry_run=dry_run)
 
 
 @app.command("exec")
@@ -222,6 +341,7 @@ def exec_cmd(
     command: str = typer.Argument(..., help="Shell command to execute"),
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
     parallel: int = typer.Option(8, "--parallel", "-j", help="Number of parallel workers"),
+    retry: int = typer.Option(0, "--retry", "-r", min=0, max=10, help="Number of retries on failure"),
     fail_fast: bool = typer.Option(False, "--fail-fast", help="Stop on first failure"),
     include_dirty: bool = typer.Option(False, "--include-dirty", help="Run on dirty repos too"),
     timeout: int = typer.Option(300, "--timeout", help="Command timeout in seconds"),
@@ -253,22 +373,17 @@ def exec_cmd(
             dry_run=dry_run,
         )
 
-    report = run_parallel(
+    report = _run_operation(
         repos=repos,
         task_fn=_task,
-        max_workers=parallel,
         command_name=f"exec: {command}",
+        parallel=parallel,
+        retry=retry,
         fail_fast=fail_fast,
+        verbose=verbose,
     )
 
-    print_results_table(report)
-    print_summary(report)
-    if not dry_run:
-        print_fail_details(report)
-    _maybe_save_json(report, json_output)
-
-    if report.fail_count > 0:
-        raise typer.Exit(code=1)
+    _finish_report(report, json_output, dry_run=dry_run)
 
 
 @app.command()
@@ -279,8 +394,10 @@ def tag(
     push: bool = typer.Option(False, "--push", help="Push tag to remote after creation"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
     parallel: int = typer.Option(4, "--parallel", "-j", help="Number of parallel workers"),
+    retry: int = typer.Option(0, "--retry", "-r", min=0, max=10, help="Number of retries on failure"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done"),
     json_output: Optional[str] = typer.Option(None, "--json", help="Save JSON report to file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Create a tag in all repositories."""
     _, repos = _get_repos(manifest, group)
@@ -295,21 +412,16 @@ def tag(
             dry_run=dry_run,
         )
 
-    report = run_parallel(
+    report = _run_operation(
         repos=repos,
         task_fn=_task,
-        max_workers=parallel,
         command_name=f"tag {tag_name}",
+        parallel=parallel,
+        retry=retry,
+        verbose=verbose,
     )
 
-    print_results_table(report)
-    print_summary(report)
-    if not dry_run:
-        print_fail_details(report)
-    _maybe_save_json(report, json_output)
-
-    if report.fail_count > 0:
-        raise typer.Exit(code=1)
+    _finish_report(report, json_output, dry_run=dry_run)
 
 
 @app.command("sync-fork")
@@ -318,8 +430,10 @@ def sync_fork_cmd(
     rebase: bool = typer.Option(False, "--rebase", help="Use rebase instead of merge"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
     parallel: int = typer.Option(4, "--parallel", "-j", help="Number of parallel workers"),
+    retry: int = typer.Option(0, "--retry", "-r", min=0, max=10, help="Number of retries on failure"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done"),
     json_output: Optional[str] = typer.Option(None, "--json", help="Save JSON report to file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Sync fork with upstream (fetch upstream and merge/rebase)."""
     _, repos = _get_repos(manifest, group)
@@ -333,21 +447,16 @@ def sync_fork_cmd(
             dry_run=dry_run,
         )
 
-    report = run_parallel(
+    report = _run_operation(
         repos=repos,
         task_fn=_task,
-        max_workers=parallel,
         command_name="sync-fork",
+        parallel=parallel,
+        retry=retry,
+        verbose=verbose,
     )
 
-    print_results_table(report)
-    print_summary(report)
-    if not dry_run:
-        print_fail_details(report)
-    _maybe_save_json(report, json_output)
-
-    if report.fail_count > 0:
-        raise typer.Exit(code=1)
+    _finish_report(report, json_output, dry_run=dry_run)
 
 
 @app.command("init")
