@@ -10,6 +10,7 @@ class RepoConfig:
     path: str
     branch: str = "main"
     remote: str = "origin"
+    upstream_remote: str = "upstream"
     groups: list[str] = field(default_factory=list)
 
 

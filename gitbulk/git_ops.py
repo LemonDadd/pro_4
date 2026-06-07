@@ -290,10 +290,36 @@ def create_tag(
         )
 
 
+INTERACTIVE_COMMANDS = {
+    "vim", "vi", "nvim", "nano", "emacs", "ed", "ex",
+    "less", "more", "most", "pg",
+    "top", "htop", "btop", "iotop", "iftop", "nload",
+    "man", "info", "watch", "tail -f", "tailf",
+    "ssh", "sftp", "telnet", "ncftp", "lftp",
+    "python", "python3", "ipython", "ruby", "irb", "node",
+    "mysql", "psql", "sqlite3", "mongo", "redis-cli",
+    "gdb", "lldb", "strace",
+    "screen", "tmux", "byobu",
+    "sudo", "su",
+}
+
+
+def _is_interactive_command(command: str) -> bool:
+    cmd_lower = command.strip().lower()
+    base_cmd = cmd_lower.split()[0] if cmd_lower.split() else ""
+    if base_cmd in INTERACTIVE_COMMANDS:
+        return True
+    for ic in INTERACTIVE_COMMANDS:
+        if " " in ic and ic in cmd_lower:
+            return True
+    return False
+
+
 def exec_command(
     repo_path: str,
     command: str,
     timeout: int = 300,
+    allow_interactive: bool = False,
     dry_run: bool = False,
 ) -> OperationResult:
     if dry_run:
@@ -302,10 +328,20 @@ def exec_command(
             ok=True,
             exit_code=0,
             stdout=f"[dry-run] Would execute: {command}",
-            meta={"action": "exec", "command": command},
+            meta={"action": "exec", "command": command, "allow_interactive": allow_interactive},
+        )
+
+    if not allow_interactive and _is_interactive_command(command):
+        return OperationResult(
+            path=repo_path,
+            ok=False,
+            exit_code=126,
+            stderr="Interactive command blocked. Use --allow-interactive to override.",
+            meta={"action": "exec", "command": command, "blocked": True},
         )
 
     try:
+        stdin = subprocess.DEVNULL if not allow_interactive else None
         result = subprocess.run(
             command,
             shell=True,
@@ -313,6 +349,7 @@ def exec_command(
             capture_output=True,
             text=True,
             timeout=timeout,
+            stdin=stdin,
         )
         return OperationResult(
             path=repo_path,
@@ -320,7 +357,7 @@ def exec_command(
             exit_code=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
-            meta={"action": "exec", "command": command},
+            meta={"action": "exec", "command": command, "allow_interactive": allow_interactive},
         )
     except subprocess.TimeoutExpired as e:
         return OperationResult(
@@ -338,6 +375,180 @@ def exec_command(
             exit_code=1,
             stderr=str(e),
             meta={"action": "exec", "command": command},
+        )
+
+
+def sync_fork(
+    repo_path: str,
+    upstream_remote: str = "upstream",
+    use_rebase: bool = False,
+    branch: Optional[str] = None,
+    dry_run: bool = False,
+) -> OperationResult:
+    if dry_run:
+        action = "rebase" if use_rebase else "merge"
+        return OperationResult(
+            path=repo_path,
+            ok=True,
+            exit_code=0,
+            stdout=f"[dry-run] Would fetch {upstream_remote} and {action} into current branch",
+            meta={
+                "action": "sync-fork",
+                "upstream_remote": upstream_remote,
+                "use_rebase": use_rebase,
+            },
+        )
+
+    try:
+        repo = Repo(repo_path)
+    except InvalidGitRepositoryError:
+        return OperationResult(
+            path=repo_path,
+            ok=False,
+            exit_code=1,
+            stderr="Not a git repository",
+            meta={"action": "sync-fork"},
+        )
+
+    try:
+        remote_names = [r.name for r in repo.remotes]
+        if upstream_remote not in remote_names:
+            return OperationResult(
+                path=repo_path,
+                ok=False,
+                exit_code=1,
+                stderr=(
+                    f"Upstream remote '{upstream_remote}' not found. "
+                    f"Available remotes: {', '.join(remote_names) if remote_names else '(none)'}. "
+                    f"Add it with: git remote add {upstream_remote} <upstream-url>"
+                ),
+                meta={
+                    "action": "sync-fork",
+                    "upstream_remote": upstream_remote,
+                    "available_remotes": remote_names,
+                },
+            )
+
+        if repo.is_dirty(untracked_files=True):
+            return OperationResult(
+                path=repo_path,
+                ok=False,
+                exit_code=1,
+                stderr="Working tree is dirty. Commit or stash changes before syncing.",
+                meta={"action": "sync-fork", "dirty": True},
+            )
+
+        current_branch = None
+        if not repo.head.is_detached:
+            current_branch = repo.active_branch.name
+        if branch and current_branch and branch != current_branch:
+            return OperationResult(
+                path=repo_path,
+                ok=False,
+                exit_code=1,
+                stderr=(
+                    f"Current branch is '{current_branch}', "
+                    f"but sync target branch is '{branch}'. "
+                    f"Checkout the target branch first."
+                ),
+                meta={
+                    "action": "sync-fork",
+                    "current_branch": current_branch,
+                    "target_branch": branch,
+                },
+            )
+
+        fetch_info = repo.remotes[upstream_remote].fetch()
+        fetch_summary = f"Fetched {len(fetch_info)} refs from {upstream_remote}"
+
+        if repo.head.is_detached:
+            return OperationResult(
+                path=repo_path,
+                ok=False,
+                exit_code=1,
+                stderr="HEAD is detached. Check out a branch to sync.",
+                meta={"action": "sync-fork", "detached": True},
+            )
+
+        upstream_branch = f"{upstream_remote}/{current_branch}"
+        try:
+            repo.git.rev_parse("--verify", upstream_branch)
+        except GitCommandError:
+            return OperationResult(
+                path=repo_path,
+                ok=False,
+                exit_code=1,
+                stderr=(
+                    f"Upstream branch '{upstream_branch}' not found. "
+                    f"The remote may not have a branch with this name."
+                ),
+                meta={
+                    "action": "sync-fork",
+                    "upstream_branch": upstream_branch,
+                },
+            )
+
+        stdout_lines = [fetch_summary]
+
+        if use_rebase:
+            try:
+                result = repo.git.rebase(upstream_branch)
+                stdout_lines.append(f"Rebased onto {upstream_branch}")
+                if result.strip():
+                    stdout_lines.append(result.strip())
+            except GitCommandError as e:
+                return OperationResult(
+                    path=repo_path,
+                    ok=False,
+                    exit_code=e.status if hasattr(e, "status") else 1,
+                    stderr=str(e.stderr) if hasattr(e, "stderr") else str(e),
+                    stdout=str(e.stdout) if hasattr(e, "stdout") else "",
+                    meta={"action": "sync-fork", "method": "rebase", "upstream_branch": upstream_branch},
+                )
+        else:
+            try:
+                result = repo.git.merge(upstream_branch)
+                stdout_lines.append(f"Merged {upstream_branch} into {current_branch}")
+                if result.strip():
+                    stdout_lines.append(result.strip())
+            except GitCommandError as e:
+                return OperationResult(
+                    path=repo_path,
+                    ok=False,
+                    exit_code=e.status if hasattr(e, "status") else 1,
+                    stderr=str(e.stderr) if hasattr(e, "stderr") else str(e),
+                    stdout=str(e.stdout) if hasattr(e, "stdout") else "",
+                    meta={"action": "sync-fork", "method": "merge", "upstream_branch": upstream_branch},
+                )
+
+        return OperationResult(
+            path=repo_path,
+            ok=True,
+            exit_code=0,
+            stdout="\n".join(stdout_lines),
+            meta={
+                "action": "sync-fork",
+                "method": "rebase" if use_rebase else "merge",
+                "upstream_remote": upstream_remote,
+                "upstream_branch": upstream_branch,
+            },
+        )
+    except GitCommandError as e:
+        return OperationResult(
+            path=repo_path,
+            ok=False,
+            exit_code=e.status if hasattr(e, "status") else 1,
+            stderr=str(e.stderr) if hasattr(e, "stderr") else str(e),
+            stdout=str(e.stdout) if hasattr(e, "stdout") else "",
+            meta={"action": "sync-fork"},
+        )
+    except Exception as e:
+        return OperationResult(
+            path=repo_path,
+            ok=False,
+            exit_code=1,
+            stderr=str(e),
+            meta={"action": "sync-fork", "error_type": type(e).__name__},
         )
 
 

@@ -17,6 +17,7 @@ from .git_ops import (
     get_status,
     is_dirty,
     pull_repo,
+    sync_fork,
 )
 from .models import OperationResult
 from .report import (
@@ -248,6 +249,7 @@ def exec_cmd(
             repo.path,
             command=command,
             timeout=timeout,
+            allow_interactive=allow_interactive,
             dry_run=dry_run,
         )
 
@@ -311,31 +313,24 @@ def tag(
 
 
 @app.command("sync-fork")
-def sync_fork(
+def sync_fork_cmd(
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
+    rebase: bool = typer.Option(False, "--rebase", help="Use rebase instead of merge"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
     parallel: int = typer.Option(4, "--parallel", "-j", help="Number of parallel workers"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done"),
     json_output: Optional[str] = typer.Option(None, "--json", help="Save JSON report to file"),
 ):
-    """Sync fork with upstream (placeholder implementation)."""
+    """Sync fork with upstream (fetch upstream and merge/rebase)."""
     _, repos = _get_repos(manifest, group)
 
     def _task(repo):
-        if dry_run:
-            return OperationResult(
-                path=repo.path,
-                ok=True,
-                exit_code=0,
-                stdout="[dry-run] Would sync fork with upstream",
-                meta={"action": "sync-fork"},
-            )
-        return OperationResult(
-            path=repo.path,
-            ok=False,
-            exit_code=1,
-            stderr="sync-fork is not fully implemented yet",
-            meta={"action": "sync-fork", "not_implemented": True},
+        return sync_fork(
+            repo.path,
+            upstream_remote=repo.upstream_remote,
+            use_rebase=rebase,
+            branch=repo.branch,
+            dry_run=dry_run,
         )
 
     report = run_parallel(
@@ -347,7 +342,12 @@ def sync_fork(
 
     print_results_table(report)
     print_summary(report)
+    if not dry_run:
+        print_fail_details(report)
     _maybe_save_json(report, json_output)
+
+    if report.fail_count > 0:
+        raise typer.Exit(code=1)
 
 
 @app.command("init")

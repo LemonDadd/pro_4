@@ -22,6 +22,7 @@ def load_manifest(manifest_path: str | Path) -> Manifest:
     defaults = data.get("defaults", {}) or {}
     default_branch = defaults.get("branch", "main")
     default_remote = defaults.get("remote", "origin")
+    default_upstream = defaults.get("upstream_remote", "upstream")
 
     groups_raw = data.get("groups", {}) or {}
     groups: dict[str, list[str]] = {}
@@ -41,12 +42,14 @@ def load_manifest(manifest_path: str | Path) -> Manifest:
     for repo_path in sorted(all_repo_paths):
         repo_branch = default_branch
         repo_remote = default_remote
+        repo_upstream = default_upstream
 
         for r in repos_raw:
             rpath = str(base_dir / Path(r["path"]))
             if rpath == repo_path:
                 repo_branch = r.get("branch", repo_branch)
                 repo_remote = r.get("remote", repo_remote)
+                repo_upstream = r.get("upstream_remote", repo_upstream)
                 break
 
         repo_groups = [
@@ -58,6 +61,7 @@ def load_manifest(manifest_path: str | Path) -> Manifest:
                 path=repo_path,
                 branch=repo_branch,
                 remote=repo_remote,
+                upstream_remote=repo_upstream,
                 groups=repo_groups,
             )
         )

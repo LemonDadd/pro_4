@@ -14,6 +14,7 @@ from gitbulk.git_ops import (
     is_dirty,
     is_git_repo,
     pull_repo,
+    sync_fork,
 )
 from gitbulk.models import OperationResult, Report
 from gitbulk.executor import run_parallel
@@ -83,6 +84,33 @@ class TestManifest:
         repo2 = [r for r in manifest.repos if "repo-2" in r.path][0]
         assert "group-b" in repo2.groups
 
+    def test_default_upstream_remote(self, temp_repos):
+        manifest = load_manifest(temp_repos["manifest_path"])
+        for repo in manifest.repos:
+            assert repo.upstream_remote == "upstream"
+
+    def test_upstream_remote_override(self, tmp_path):
+        manifest_path = tmp_path / "repos.yaml"
+        repo_dir = tmp_path / "myrepo"
+        repo_dir.mkdir()
+        Repo.init(repo_dir)
+        manifest_data = {
+            "defaults": {
+                "branch": "main",
+                "remote": "origin",
+                "upstream_remote": "my-upstream",
+            },
+            "repos": [
+                {"path": "./myrepo", "upstream_remote": "custom-upstream"},
+            ],
+        }
+        with open(manifest_path, "w") as f:
+            yaml.dump(manifest_data, f)
+
+        manifest = load_manifest(str(manifest_path))
+        repo = manifest.repos[0]
+        assert repo.upstream_remote == "custom-upstream"
+
 
 class TestGitOps:
     def test_is_git_repo(self, temp_repos):
@@ -132,6 +160,63 @@ class TestGitOps:
         result = exec_command(repo_path, "exit 1")
         assert not result.ok
         assert result.exit_code == 1
+
+    def test_exec_command_interactive_blocked(self, temp_repos):
+        repo_path = temp_repos["repos"][0]
+        result = exec_command(repo_path, "vim", allow_interactive=False)
+        assert not result.ok
+        assert result.exit_code == 126
+        assert "blocked" in result.stderr.lower()
+        assert result.meta.get("blocked") is True
+
+    def test_exec_command_interactive_allowed(self, temp_repos):
+        repo_path = temp_repos["repos"][0]
+        result = exec_command(repo_path, "echo vim_is_ok", allow_interactive=True)
+        assert result.ok
+        assert "vim_is_ok" in result.stdout
+
+    def test_exec_command_interactive_tail_f(self, temp_repos):
+        repo_path = temp_repos["repos"][0]
+        result = exec_command(repo_path, "tail -f /dev/null", allow_interactive=False)
+        assert not result.ok
+        assert result.exit_code == 126
+
+    def test_sync_fork_no_upstream(self, temp_repos):
+        repo_path = temp_repos["repos"][0]
+        result = sync_fork(repo_path, upstream_remote="upstream")
+        assert not result.ok
+        assert "not found" in result.stderr
+        assert "upstream" in result.stderr
+
+    def test_sync_fork_dry_run(self, temp_repos):
+        repo_path = temp_repos["repos"][0]
+        result = sync_fork(repo_path, dry_run=True)
+        assert result.ok
+        assert "dry-run" in result.stdout
+        assert "merge" in result.stdout.lower()
+
+    def test_sync_fork_dry_run_rebase(self, temp_repos):
+        repo_path = temp_repos["repos"][0]
+        result = sync_fork(repo_path, use_rebase=True, dry_run=True)
+        assert result.ok
+        assert "rebase" in result.stdout.lower()
+
+    def test_sync_fork_dirty_repo(self, tmp_path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        repo = Repo.init(repo_dir)
+        repo.config_writer().set_value("user", "email", "test@test.com").release()
+        repo.config_writer().set_value("user", "name", "Test").release()
+        (repo_dir / "file.txt").write_text("hello\n")
+        repo.index.add(["file.txt"])
+        repo.index.commit("initial")
+        repo.create_remote("upstream", "https://example.com/upstream.git")
+
+        (repo_dir / "dirty.txt").write_text("dirty\n")
+
+        result = sync_fork(str(repo_dir), upstream_remote="upstream")
+        assert not result.ok
+        assert "dirty" in result.stderr.lower()
 
     def test_pull_repo_no_remote(self, temp_repos):
         repo_path = temp_repos["repos"][0]
