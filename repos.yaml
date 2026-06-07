@@ -1,0 +1,14 @@
+groups:
+  backend:
+    - ./test_repos/svc-user
+    - ./test_repos/svc-order
+  frontend:
+    - ./test_repos/web-admin
+
+defaults:
+  branch: main
+  remote: origin
+
+repos:
+  - path: ./test_repos/svc-order
+    branch: develop

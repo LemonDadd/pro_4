@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitbulk"
+version = "0.1.0"
+description = "Git multi-repository batch operation tool"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "gitbulk contributors" },
+]
+license = { text = "MIT" }
+dependencies = [
+    "GitPython>=3.1.40",
+    "typer>=0.9.0",
+    "rich>=13.7.0",
+    "PyYAML>=6.0.1",
+]
+
+[project.scripts]
+gitbulk = "gitbulk.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["gitbulk*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

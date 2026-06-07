@@ -50,3 +50,6 @@ coverage/
 .nyc_output/
 htmlcov/
 .pytest_cache/
+
+# gitbulk 测试数据
+test_repos/
