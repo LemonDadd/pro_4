@@ -296,6 +296,7 @@ INTERACTIVE_COMMANDS = {
     "top", "htop", "btop", "iotop", "iftop", "nload",
     "man", "info", "watch",
     "ssh", "sftp", "telnet", "ncftp", "lftp",
+    "ipython", "irb",
     "gdb", "lldb",
     "screen", "tmux", "byobu",
     "sudo", "su",
@@ -306,6 +307,8 @@ INTERACTIVE_MULTIWORD = [
     ("tail", "-F"),
     ("tailf",),
 ]
+
+REPL_INTERPRETERS = {"python", "python3", "python2", "node", "nodejs", "ruby", "php", "tclsh", "wish"}
 
 SHELL_COMMANDS = {"sh", "bash", "zsh", "ksh", "dash", "fish"}
 

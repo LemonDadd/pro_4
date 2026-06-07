@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 import typer
-from rich.console import Console
 
 from . import __version__
 from .config import find_manifest, generate_manifest, load_manifest
@@ -38,6 +38,15 @@ app = typer.Typer(
 )
 
 
+@dataclass
+class GlobalOptions:
+    dry_run: bool = False
+    json_output: Optional[str] = None
+    verbose: bool = False
+    manifest: Optional[str] = None
+    group: Optional[str] = None
+
+
 def _version_callback(value: bool):
     if value:
         console.print(f"gitbulk v{__version__}")
@@ -46,12 +55,53 @@ def _version_callback(value: bool):
 
 @app.callback()
 def main(
+    ctx: typer.Context,
     version: Optional[bool] = typer.Option(
         None, "--version", callback=_version_callback, is_eager=True,
         help="Show version and exit."
     ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Show what would be done without making changes.",
+    ),
+    json_output: Optional[str] = typer.Option(
+        None, "--json", metavar="FILE",
+        help="Save JSON report to file.",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Verbose output with per-repo details.",
+    ),
+    manifest: Optional[str] = typer.Option(
+        None, "--manifest", "-m",
+        help="Path to repos.yaml manifest file.",
+    ),
+    group: Optional[str] = typer.Option(
+        None, "--group", "-g",
+        help="Filter repos by group name.",
+    ),
 ):
-    pass
+    ctx.obj = GlobalOptions(
+        dry_run=dry_run,
+        json_output=json_output,
+        verbose=verbose,
+        manifest=manifest,
+        group=group,
+    )
+
+
+def _g(ctx: typer.Context) -> GlobalOptions:
+    if ctx.obj is None:
+        ctx.obj = GlobalOptions()
+    return ctx.obj
+
+
+def _or_local(global_val, local_val):
+    if isinstance(local_val, bool):
+        return local_val or global_val
+    if local_val is None or local_val == "" or local_val == []:
+        return global_val
+    return local_val
 
 
 def _get_repos(manifest_path: Optional[str], group: Optional[str]) -> tuple:
@@ -84,7 +134,7 @@ def _repo_name(path: str) -> str:
 
 def _make_verbose_callbacks(
     verbose: bool,
-) -> tuple[Optional[Callable], Optional[Callable], Optional[Callable], Optional[Callable]]:
+):
     if not verbose:
         return None, None, None, None
 
@@ -144,9 +194,7 @@ def _run_operation(
     retry: int = 0,
     fail_fast: bool = False,
     verbose: bool = False,
-) -> "Report":
-    from .models import Report
-
+):
     on_start, on_done, on_retry_start, on_retry_done = _make_verbose_callbacks(verbose)
 
     if verbose:
@@ -204,16 +252,21 @@ def _finish_report(
 
 @app.command("list")
 def list_cmd(
+    ctx: typer.Context,
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
 ):
     """List all repositories in the manifest."""
+    g = _g(ctx)
+    manifest = _or_local(g.manifest, manifest)
+    group = _or_local(g.group, group)
     _, repos = _get_repos(manifest, group)
     print_repo_list(repos, group)
 
 
 @app.command()
 def status(
+    ctx: typer.Context,
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
     fetch: bool = typer.Option(False, "--fetch", help="Fetch from remote before status"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
@@ -223,6 +276,12 @@ def status(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Show status of all repositories."""
+    g = _g(ctx)
+    manifest = _or_local(g.manifest, manifest)
+    group = _or_local(g.group, group)
+    verbose = _or_local(g.verbose, verbose)
+    json_output = _or_local(g.json_output, json_output)
+
     _, repos = _get_repos(manifest, group)
 
     def _task(repo):
@@ -272,6 +331,7 @@ def status(
 
 @app.command()
 def pull(
+    ctx: typer.Context,
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
     rebase: bool = typer.Option(False, "--rebase", help="Pull with rebase"),
     no_ff_only: bool = typer.Option(False, "--no-ff-only", help="Disable fast-forward only"),
@@ -283,6 +343,13 @@ def pull(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Pull latest changes for all repositories."""
+    g = _g(ctx)
+    manifest = _or_local(g.manifest, manifest)
+    group = _or_local(g.group, group)
+    verbose = _or_local(g.verbose, verbose)
+    json_output = _or_local(g.json_output, json_output)
+    dry_run = _or_local(g.dry_run, dry_run)
+
     _, repos = _get_repos(manifest, group)
 
     def _task(repo):
@@ -309,6 +376,7 @@ def pull(
 
 @app.command()
 def checkout(
+    ctx: typer.Context,
     branch: str = typer.Argument(..., help="Branch name to checkout"),
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
@@ -319,6 +387,13 @@ def checkout(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Checkout a branch in all repositories."""
+    g = _g(ctx)
+    manifest = _or_local(g.manifest, manifest)
+    group = _or_local(g.group, group)
+    verbose = _or_local(g.verbose, verbose)
+    json_output = _or_local(g.json_output, json_output)
+    dry_run = _or_local(g.dry_run, dry_run)
+
     _, repos = _get_repos(manifest, group)
 
     def _task(repo):
@@ -338,6 +413,7 @@ def checkout(
 
 @app.command("exec")
 def exec_cmd(
+    ctx: typer.Context,
     command: str = typer.Argument(..., help="Shell command to execute"),
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
     parallel: int = typer.Option(8, "--parallel", "-j", help="Number of parallel workers"),
@@ -354,6 +430,13 @@ def exec_cmd(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Execute a shell command in all repositories."""
+    g = _g(ctx)
+    manifest = _or_local(g.manifest, manifest)
+    group = _or_local(g.group, group)
+    verbose = _or_local(g.verbose, verbose)
+    json_output = _or_local(g.json_output, json_output)
+    dry_run = _or_local(g.dry_run, dry_run)
+
     _, repos = _get_repos(manifest, group)
 
     def _task(repo):
@@ -388,6 +471,7 @@ def exec_cmd(
 
 @app.command()
 def tag(
+    ctx: typer.Context,
     tag_name: str = typer.Argument(..., help="Tag name to create"),
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
     message: Optional[str] = typer.Option(None, "--message", "-m", help="Tag message (annotated)"),
@@ -400,6 +484,13 @@ def tag(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Create a tag in all repositories."""
+    g = _g(ctx)
+    manifest = _or_local(g.manifest, manifest)
+    group = _or_local(g.group, group)
+    verbose = _or_local(g.verbose, verbose)
+    json_output = _or_local(g.json_output, json_output)
+    dry_run = _or_local(g.dry_run, dry_run)
+
     _, repos = _get_repos(manifest, group)
 
     def _task(repo):
@@ -426,8 +517,18 @@ def tag(
 
 @app.command("sync-fork")
 def sync_fork_cmd(
+    ctx: typer.Context,
     group: Optional[str] = typer.Option(None, "--group", "-g", help="Filter by group name"),
-    rebase: bool = typer.Option(False, "--rebase", help="Use rebase instead of merge"),
+    rebase: bool = typer.Option(
+        False, "--rebase",
+        help="Use rebase instead of merge to sync with upstream. "
+             "Rebase replays your commits on top of upstream (cleaner history); "
+             "merge creates a merge commit (preserves history).",
+    ),
+    include_dirty: bool = typer.Option(
+        False, "--include-dirty",
+        help="Sync even if working tree is dirty (not recommended, may cause conflicts).",
+    ),
     manifest: Optional[str] = typer.Option(None, "--manifest", "-m", help="Path to repos.yaml"),
     parallel: int = typer.Option(4, "--parallel", "-j", help="Number of parallel workers"),
     retry: int = typer.Option(0, "--retry", "-r", min=0, max=10, help="Number of retries on failure"),
@@ -435,15 +536,32 @@ def sync_fork_cmd(
     json_output: Optional[str] = typer.Option(None, "--json", help="Save JSON report to file"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
-    """Sync fork with upstream (fetch upstream and merge/rebase)."""
+    """Sync fork with upstream (fetch upstream and merge/rebase).
+
+    By default, merges the upstream tracking branch into the current branch.
+    Use --rebase to replay local commits on top of upstream instead.
+
+    The upstream branch is determined by repo.upstream_branch (defaults to the
+    same name as the current branch). Configure per-repo in repos.yaml.
+    """
+    g = _g(ctx)
+    manifest = _or_local(g.manifest, manifest)
+    group = _or_local(g.group, group)
+    verbose = _or_local(g.verbose, verbose)
+    json_output = _or_local(g.json_output, json_output)
+    dry_run = _or_local(g.dry_run, dry_run)
+
     _, repos = _get_repos(manifest, group)
 
     def _task(repo):
+        upstream_branch = getattr(repo, "upstream_branch", None)
         return sync_fork(
             repo.path,
             upstream_remote=repo.upstream_remote,
+            upstream_branch=upstream_branch,
             use_rebase=rebase,
             branch=repo.branch,
+            include_dirty=include_dirty,
             dry_run=dry_run,
         )
 
