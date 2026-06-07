@@ -294,24 +294,209 @@ INTERACTIVE_COMMANDS = {
     "vim", "vi", "nvim", "nano", "emacs", "ed", "ex",
     "less", "more", "most", "pg",
     "top", "htop", "btop", "iotop", "iftop", "nload",
-    "man", "info", "watch", "tail -f", "tailf",
+    "man", "info", "watch",
     "ssh", "sftp", "telnet", "ncftp", "lftp",
-    "python", "python3", "ipython", "ruby", "irb", "node",
-    "mysql", "psql", "sqlite3", "mongo", "redis-cli",
-    "gdb", "lldb", "strace",
+    "gdb", "lldb",
     "screen", "tmux", "byobu",
     "sudo", "su",
 }
 
+INTERACTIVE_MULTIWORD = [
+    ("tail", "-f"),
+    ("tail", "-F"),
+    ("tailf",),
+]
+
+SHELL_COMMANDS = {"sh", "bash", "zsh", "ksh", "dash", "fish"}
+
+
+def _split_tokens(command: str) -> list[str]:
+    tokens = []
+    current = []
+    quote = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == "\\" and i + 1 < len(command):
+                current.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+                i += 1
+                continue
+            current.append(ch)
+            i += 1
+        else:
+            if ch in ('"', "'"):
+                quote = ch
+                i += 1
+                continue
+            if ch.isspace():
+                if current:
+                    tokens.append("".join(current))
+                    current = []
+                i += 1
+                continue
+            current.append(ch)
+            i += 1
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _extract_shell_c_arg(tokens: list[str]) -> str | None:
+    if not tokens or tokens[0] not in SHELL_COMMANDS:
+        return None
+    for i, token in enumerate(tokens[1:], start=1):
+        if token == "-c":
+            if i + 1 < len(tokens):
+                return tokens[i + 1]
+            return None
+        if token.startswith("-c"):
+            rest = token[2:]
+            if rest:
+                return rest
+            if i + 1 < len(tokens):
+                return tokens[i + 1]
+            return None
+    return None
+
+
+def _extract_sudo_command(tokens: list[str]) -> list[str] | None:
+    if not tokens or tokens[0] != "sudo":
+        return None
+    i = 1
+    while i < len(tokens):
+        token = tokens[i]
+        if token.startswith("-"):
+            if token in ("-u", "--user", "-g", "--group", "-U", "--other-user"):
+                i += 2
+            else:
+                i += 1
+        else:
+            return tokens[i:]
+    return None
+
+
+def _is_interactive_simple(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    base = tokens[0]
+    if base in INTERACTIVE_COMMANDS:
+        return True
+    for multiword in INTERACTIVE_MULTIWORD:
+        if len(tokens) >= len(multiword):
+            match = True
+            for i, word in enumerate(multiword):
+                if tokens[i] != word:
+                    match = False
+                    break
+            if match:
+                return True
+    return False
+
 
 def _is_interactive_command(command: str) -> bool:
     cmd_lower = command.strip().lower()
-    base_cmd = cmd_lower.split()[0] if cmd_lower.split() else ""
-    if base_cmd in INTERACTIVE_COMMANDS:
-        return True
-    for ic in INTERACTIVE_COMMANDS:
-        if " " in ic and ic in cmd_lower:
+    if not cmd_lower:
+        return False
+
+    segments = []
+    current_seg = []
+    quote = None
+    i = 0
+    while i < len(cmd_lower):
+        ch = cmd_lower[i]
+        if quote:
+            current_seg.append(ch)
+            if ch == "\\" and i + 1 < len(cmd_lower):
+                current_seg.append(cmd_lower[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+        else:
+            if ch in ('"', "'"):
+                quote = ch
+                current_seg.append(ch)
+                i += 1
+                continue
+
+            if cmd_lower[i:i + 2] == "||":
+                if current_seg:
+                    segments.append(("or", "".join(current_seg).strip()))
+                    current_seg = []
+                i += 2
+                continue
+
+            if cmd_lower[i:i + 2] == "&&":
+                if current_seg:
+                    segments.append(("and", "".join(current_seg).strip()))
+                    current_seg = []
+                i += 2
+                continue
+
+            if ch == "|":
+                if current_seg:
+                    segments.append(("pipe", "".join(current_seg).strip()))
+                    current_seg = []
+                i += 1
+                continue
+
+            if ch == ";":
+                if current_seg:
+                    segments.append(("semicolon", "".join(current_seg).strip()))
+                    current_seg = []
+                i += 1
+                continue
+
+            if ch == "&":
+                if current_seg:
+                    segments.append(("amp", "".join(current_seg).strip()))
+                    current_seg = []
+                i += 1
+                continue
+
+            current_seg.append(ch)
+            i += 1
+
+    if current_seg:
+        segments.append(("last", "".join(current_seg).strip()))
+
+    for _, seg_text in segments:
+        if _is_interactive_segment(seg_text):
             return True
+
+    return False
+
+
+def _is_interactive_segment(segment: str) -> bool:
+    if not segment:
+        return False
+    tokens = _split_tokens(segment)
+    if not tokens:
+        return False
+
+    if _is_interactive_simple(tokens):
+        return True
+
+    shell_inner = _extract_shell_c_arg(tokens)
+    if shell_inner is not None:
+        if _is_interactive_command(shell_inner):
+            return True
+
+    sudo_cmd = _extract_sudo_command(tokens)
+    if sudo_cmd is not None:
+        if _is_interactive_simple(sudo_cmd):
+            return True
+        shell_inner = _extract_shell_c_arg(sudo_cmd)
+        if shell_inner is not None:
+            if _is_interactive_command(shell_inner):
+                return True
+
     return False
 
 

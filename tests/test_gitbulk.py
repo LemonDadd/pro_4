@@ -181,6 +181,40 @@ class TestGitOps:
         assert not result.ok
         assert result.exit_code == 126
 
+    def test_exec_command_script_not_blocked(self, temp_repos):
+        repo_path = temp_repos["repos"][0]
+        result = exec_command(repo_path, "python3 -c 'print(1)'", allow_interactive=False)
+        assert result.ok
+        assert "1" in result.stdout
+
+    def test_exec_command_pipe_blocked(self, temp_repos):
+        from gitbulk.git_ops import _is_interactive_command
+        assert _is_interactive_command("echo hello | less")
+        assert _is_interactive_command("cat file | more")
+
+    def test_exec_command_pipe_not_blocked(self, temp_repos):
+        from gitbulk.git_ops import _is_interactive_command
+        assert not _is_interactive_command("ls | grep test")
+        assert not _is_interactive_command("cat file | sort | uniq")
+
+    def test_exec_command_nested_shell_blocked(self, temp_repos):
+        from gitbulk.git_ops import _is_interactive_command
+        assert _is_interactive_command("bash -c 'vim file'")
+        assert _is_interactive_command('sh -c "tail -f log"')
+        assert _is_interactive_command("sudo bash -c 'vim /etc/passwd'")
+
+    def test_exec_command_semicolon_blocked(self, temp_repos):
+        from gitbulk.git_ops import _is_interactive_command
+        assert _is_interactive_command("echo hi ; vim")
+        assert _is_interactive_command("true && less")
+        assert _is_interactive_command("false || top")
+
+    def test_exec_command_node_script_not_blocked(self, temp_repos):
+        from gitbulk.git_ops import _is_interactive_command
+        assert not _is_interactive_command("node build.js")
+        assert not _is_interactive_command("npm run build")
+        assert not _is_interactive_command("npm audit --json")
+
     def test_sync_fork_no_upstream(self, temp_repos):
         repo_path = temp_repos["repos"][0]
         result = sync_fork(repo_path, upstream_remote="upstream")
